@@ -77,21 +77,24 @@ def process_cbc_data(df, num_attributes):
         selected = parse_profile(row['Selected Profiles'])
         not_selected_str = row['Not Selected Profiles']
         
-        # Handle multiple not selected profiles (separated by semicolon or multiple columns)
-        if ';' in str(not_selected_str):
-            not_selected_list = [parse_profile(p) for p in not_selected_str.split(';')]
+        # Handle multiple not selected profiles (separated by semicolon)
+        if pd.notna(not_selected_str) and ';' in str(not_selected_str):
+            not_selected_list = [parse_profile(p.strip()) for p in str(not_selected_str).split(';') if p.strip()]
         else:
             not_selected_list = [parse_profile(not_selected_str)]
         
+        # Filter out any None or empty profiles
+        not_selected_list = [p for p in not_selected_list if p and len(p) == num_attributes]
+        
         # Add selected profile with choice = 1
-        if len(selected) == num_attributes:
+        if selected and len(selected) == num_attributes:
             row_data = {
                 'Respondent_ID': respondent_id,
                 'Choice_Set': choice_set,
                 'Choice': 1
             }
             for i, val in enumerate(selected):
-                row_data[f'Attribute_{i+1}'] = val
+                row_data[f'Attribute_{i+1}'] = val.strip()
             processed_rows.append(row_data)
         
         # Add not selected profiles with choice = 0
@@ -103,7 +106,7 @@ def process_cbc_data(df, num_attributes):
                     'Choice': 0
                 }
                 for i, val in enumerate(not_selected):
-                    row_data[f'Attribute_{i+1}'] = val
+                    row_data[f'Attribute_{i+1}'] = val.strip()
                 processed_rows.append(row_data)
     
     return pd.DataFrame(processed_rows)
@@ -308,11 +311,18 @@ if page == "📤 Data Upload":
                     for i, name in enumerate(attribute_names):
                         processed_df.rename(columns={f'Attribute_{i+1}': name}, inplace=True)
                     
-                    # Detect unique levels for each attribute
+                    # Detect unique levels for each attribute - SEPARATELY BY COLUMN
                     attributes_dict = {}
                     for attr_name in attribute_names:
-                        levels = sorted(processed_df[attr_name].unique().tolist())
-                        attributes_dict[attr_name] = levels
+                        if attr_name in processed_df.columns:
+                            # Get unique levels for THIS specific attribute only
+                            levels = sorted(processed_df[attr_name].dropna().unique().tolist())
+                            # Remove any empty strings
+                            levels = [str(l).strip() for l in levels if str(l).strip() != '']
+                            attributes_dict[attr_name] = levels
+                        else:
+                            st.error(f"Column {attr_name} not found in processed data!")
+                            attributes_dict[attr_name] = []
                     
                     st.session_state.attributes = attributes_dict
                     st.session_state.processed_data = processed_df
@@ -324,10 +334,13 @@ if page == "📤 Data Upload":
                     st.markdown("### Processed Data Preview")
                     st.dataframe(processed_df.head(20))
                     
-                    # Show attribute levels
+                    # Show attribute levels - CLEARER FORMAT
                     st.markdown("### Detected Attribute Levels")
-                    for attr_name, levels in attributes_dict.items():
-                        st.write(f"**{attr_name}**: {', '.join(levels)}")
+                    
+                    # Create a nice table format
+                    for i, (attr_name, levels) in enumerate(attributes_dict.items(), 1):
+                        with st.expander(f"**{i}. {attr_name}** ({len(levels)} levels)", expanded=True):
+                            st.write("Levels: " + " | ".join(levels))
                     
                     st.info("👉 Proceed to 'Model Estimation' to calculate utilities!")
 
