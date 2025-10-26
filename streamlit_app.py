@@ -4,11 +4,13 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from sklearn.linear_model import LogisticRegression
-from itertools import product
 import io
 import re
+from typing import List, Dict, Any
 
-# Page configuration
+# ============================================================================
+# PAGE CONFIGURATION & STYLING
+# ============================================================================
 st.set_page_config(
     page_title="CBC Conjoint Analysis Platform",
     page_icon="📊",
@@ -16,285 +18,202 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
 st.markdown("""
     <style>
     .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        padding: 1rem 0;
+        font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; padding: 1rem 0;
     }
     .sub-header {
-        font-size: 1.5rem;
-        font-weight: 600;
-        color: #2c3e50;
-        margin-top: 2rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1f77b4;
+        font-size: 1.5rem; font-weight: 600; color: #2c3e50; margin-top: 2rem;
     }
     </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
+# ============================================================================
+# SESSION STATE INITIALIZATION
+# ============================================================================
 if 'data_processed' not in st.session_state:
-    st.session_state.data_processed = False
-if 'utilities' not in st.session_state:
-    st.session_state.utilities = None
-if 'raw_data' not in st.session_state:
-    st.session_state.raw_data = None
-if 'attributes' not in st.session_state:
-    st.session_state.attributes = {}
-if 'attribute_names' not in st.session_state:
-    st.session_state.attribute_names = []
+    st.session_state.update({
+        'data_processed': False,
+        'utilities': None,
+        'raw_data': None,
+        'processed_data': None,
+        'attributes': {},,
+        'attribute_names': [],
+        'price_attribute': None
+    })
 
 # ============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (WITH IMPROVEMENTS & CACHING)
 # ============================================================================
 
-def parse_profile(profile_str):
-    """Parse profile string like '[Brand, Storage, Price]' into list"""
-    if pd.isna(profile_str) or profile_str == '' or profile_str is None:
+def parse_profile(profile_str: str) -> List[str]:
+    """Parse profile string like '[Brand, "1,000 GB", Price]' into a list."""
+    if pd.isna(profile_str) or not isinstance(profile_str, str) or not profile_str.strip():
         return None
     
-    # Convert to string and clean
-    profile_str = str(profile_str).strip()
-    
+    # CRITICAL FIX: Normalize non-standard delimiters to standard commas
+    profile_str = profile_str.replace('’', ',').replace('‘', ',')
+
     # Remove outer brackets
+    profile_str = profile_str.strip()
     if profile_str.startswith('[') and profile_str.endswith(']'):
         profile_str = profile_str[1:-1]
     
-    # Split by comma and clean each value
-    values = [item.strip() for item in profile_str.split(',') if item.strip()]
+    # Regex to split by comma, but ignore commas inside quotes
+    values = re.split(r',(?=(?:[^"]*"[^"]*")*[^"]*$)', profile_str)
+    cleaned_values = [v.strip().strip('"') for v in values if v.strip()]
     
-    return values if values else None
+    return cleaned_values if cleaned_values else None
 
-def process_cbc_data(df, num_attributes):
-    """Process raw CBC data into format suitable for modeling"""
+@st.cache_data
+def process_cbc_data(df: pd.DataFrame, num_attributes: int) -> pd.DataFrame:
+    """Process raw CBC data into a format suitable for modeling."""
     processed_rows = []
     parsing_errors = []
     
     for idx, row in df.iterrows():
-        respondent_id = row['Respondent ID']
-        choice_set = row['Set']
-        
-        # Parse selected profile
-        selected = parse_profile(row['Selected Profiles'])
-        
-        # Debug first few rows
-        if idx < 3:
-            print(f"\n=== Row {idx} Debug ===")
-            print(f"Selected raw: '{row['Selected Profiles']}'")
-            print(f"Selected parsed: {selected}")
-            print(f"Not Selected raw: '{row['Not Selected Profiles']}'")
-        
-        # Skip if selected profile is invalid
-        if selected is None or len(selected) != num_attributes:
-            parsing_errors.append(f"Row {idx}: Invalid selected profile (got {len(selected) if selected else 0} attrs, expected {num_attributes})")
-            continue
-        
-        # Parse not selected profiles
-        not_selected_str = str(row['Not Selected Profiles']) if pd.notna(row['Not Selected Profiles']) else ''
-        
-        # CRITICAL FIX: Split by semicolon first, THEN by brackets
-        # Some files may have format: [A,B,C];[D,E,F] or [A,B,C] [D,E,F]
-        # Need to find all bracketed groups
-        import re
-        
-        # Find all complete bracketed profiles
-        bracket_pattern = r'\[([^\]]+)\]'
-        not_selected_matches = re.findall(bracket_pattern, not_selected_str)
-        
-        if idx < 3:
-            print(f"Not Selected matches: {not_selected_matches}")
-        
-        # Parse each matched profile
-        not_selected_list = []
-        for match in not_selected_matches:
-            # match is already inside brackets, so just split by comma
-            values = [v.strip() for v in match.split(',') if v.strip()]
-            if len(values) == num_attributes:
-                not_selected_list.append(values)
-                if idx < 3:
-                    print(f"  Parsed: {values}")
-            else:
-                if idx < 3:
-                    print(f"  SKIPPED (wrong length): {values}")
-        
-        # Add selected profile (Choice = 1)
-        row_data = {
-            'Respondent_ID': respondent_id,
-            'Choice_Set': choice_set,
-            'Choice': 1
-        }
-        for attr_idx in range(num_attributes):
-            row_data[f'Attribute_{attr_idx+1}'] = selected[attr_idx]
-        processed_rows.append(row_data)
-        
-        # Add not selected profiles (Choice = 0)
-        for not_selected in not_selected_list:
-            row_data = {
-                'Respondent_ID': respondent_id,
-                'Choice_Set': choice_set,
-                'Choice': 0
-            }
-            for attr_idx in range(num_attributes):
-                row_data[f'Attribute_{attr_idx+1}'] = not_selected[attr_idx]
+        try:
+            respondent_id = row['Respondent ID']
+            choice_set = row['Set']
+            
+            selected = parse_profile(row['Selected Profiles'])
+            if selected is None or len(selected) != num_attributes:
+                parsing_errors.append(f"Row {idx+2}: Invalid 'Selected' profile. Expected {num_attributes} attributes, got {len(selected) if selected else 0}.")
+                continue
+            
+            not_selected_str = str(row['Not Selected Profiles']) if pd.notna(row['Not Selected Profiles']) else ''
+            bracket_pattern = r'\[([^\]]+)\]'
+            not_selected_matches = re.findall(bracket_pattern, not_selected_str)
+            
+            not_selected_list = []
+            for match in not_selected_matches:
+                values = parse_profile(f"[{match}]")
+                if values and len(values) == num_attributes:
+                    not_selected_list.append(values)
+            
+            row_data = {'Respondent_ID': respondent_id, 'Choice_Set': choice_set, 'Choice': 1}
+            for attr_idx, level in enumerate(selected):
+                row_data[f'Attribute_{attr_idx+1}'] = level
             processed_rows.append(row_data)
-    
-    result_df = pd.DataFrame(processed_rows)
-    
-    # Debug: Print summary
-    if len(result_df) > 0:
-        print(f"\n=== Processing Summary ===")
-        print(f"Processed {len(result_df)} choice observations")
-        print(f"Unique respondents: {result_df['Respondent_ID'].nunique()}")
-        print(f"Alternatives per set: {result_df.groupby(['Respondent_ID', 'Choice_Set']).size().mean():.1f}")
-        if parsing_errors:
-            print(f"\nParsing errors: {len(parsing_errors)}")
-            for error in parsing_errors[:5]:
-                print(f"  - {error}")
-    
-    return result_df
+            
+            for not_selected in not_selected_list:
+                row_data = {'Respondent_ID': respondent_id, 'Choice_Set': choice_set, 'Choice': 0}
+                for attr_idx, level in enumerate(not_selected):
+                    row_data[f'Attribute_{attr_idx+1}'] = level
+                processed_rows.append(row_data)
+        except Exception as e:
+            parsing_errors.append(f"Row {idx+2}: Unexpected error - {e}")
 
-def create_design_matrix(df, attributes_dict):
-    """Create dummy-coded design matrix for conjoint analysis"""
+    if parsing_errors:
+        st.warning(f"Found {len(parsing_errors)} parsing errors. Some rows may have been skipped. Example: {parsing_errors[0]}")
+        
+    return pd.DataFrame(processed_rows)
+
+def create_design_matrix(df: pd.DataFrame, attributes_dict: Dict[str, List[str]]) -> pd.DataFrame:
+    """Create a dummy-coded design matrix for conjoint analysis."""
     design_df = df.copy()
-    
-    # Create dummy variables for each attribute
     for attr_name, levels in attributes_dict.items():
-        # Use the first level as reference (dropped)
-        for level in levels[1:]:  # Skip first level (reference)
+        for level in levels[1:]:  # First level is the reference
             col_name = f"{attr_name}_{level}"
             design_df[col_name] = (df[attr_name] == level).astype(int)
-    
     return design_df
 
-def estimate_utilities(design_df, attributes_dict):
-    """Estimate part-worth utilities using multinomial logit at individual level"""
-    respondents = design_df['Respondent_ID'].unique()
+@st.cache_data
+def estimate_utilities(_design_df: pd.DataFrame, _attributes_dict: Dict[str, List[str]]) -> pd.DataFrame:
+    """Estimate part-worth utilities using logistic regression at the individual level."""
+    respondents = _design_df['Respondent_ID'].unique()
     utilities_list = []
-    
-    # Get feature columns (all dummy variables)
-    feature_cols = []
-    for attr_name, levels in attributes_dict.items():
-        for level in levels[1:]:
-            feature_cols.append(f"{attr_name}_{level}")
+    failed_respondents = []
+
+    feature_cols = [f"{attr}_{level}" for attr, levels in _attributes_dict.items() for level in levels[1:]]
     
     for resp_id in respondents:
-        resp_data = design_df[design_df['Respondent_ID'] == resp_id]
-        
+        resp_data = _design_df[_design_df['Respondent_ID'] == resp_id]
         X = resp_data[feature_cols].values
         y = resp_data['Choice'].values
         
-        # Fit logistic regression
+        if len(np.unique(y)) < 2:
+            failed_respondents.append(resp_id)
+            continue
+
         try:
-            model = LogisticRegression(fit_intercept=False, max_iter=1000, solver='lbfgs')
+            model = LogisticRegression(fit_intercept=False, max_iter=1000, solver='lbfgs', C=1e6)
             model.fit(X, y)
-            
-            # Get coefficients
             coeffs = model.coef_[0]
             
-            # Build utility dictionary
             utility_dict = {'Respondent_ID': resp_id}
-            
-            # Add utilities for each attribute level
             idx = 0
-            for attr_name, levels in attributes_dict.items():
-                # Reference level gets utility of 0
+            for attr_name, levels in _attributes_dict.items():
                 utility_dict[f"{attr_name}_{levels[0]}"] = 0.0
-                
-                # Other levels get their coefficients
                 for level in levels[1:]:
                     utility_dict[f"{attr_name}_{level}"] = coeffs[idx]
                     idx += 1
-            
             utilities_list.append(utility_dict)
-        except:
-            # If model fails, assign zeros
-            utility_dict = {'Respondent_ID': resp_id}
-            for attr_name, levels in attributes_dict.items():
-                for level in levels:
-                    utility_dict[f"{attr_name}_{level}"] = 0.0
-            utilities_list.append(utility_dict)
-    
+        except Exception:
+            failed_respondents.append(resp_id)
+
+    if failed_respondents:
+        st.warning(f"Could not estimate utilities for {len(failed_respondents)} respondents (e.g., no variation in choices). They were excluded.")
+
     return pd.DataFrame(utilities_list)
 
-def calculate_attribute_importance(utilities_df, attributes_dict):
-    """Calculate attribute importance using range method"""
+@st.cache_data
+def calculate_attribute_importance(_utilities_df: pd.DataFrame, _attributes_dict: Dict[str, List[str]]) -> pd.DataFrame:
+    """Calculate attribute importance using the range method."""
     importance_data = []
-    
-    for attr_name, levels in attributes_dict.items():
-        # Get utility columns for this attribute
+    for attr_name, levels in _attributes_dict.items():
         util_cols = [f"{attr_name}_{level}" for level in levels]
-        
-        # Calculate range for each respondent
-        ranges = []
-        for _, row in utilities_df.iterrows():
-            utils = [row[col] for col in util_cols]
-            ranges.append(max(utils) - min(utils))
-        
-        avg_range = np.mean(ranges)
-        importance_data.append({
-            'Attribute': attr_name,
-            'Average_Range': avg_range
-        })
+        ranges = _utilities_df[util_cols].max(axis=1) - _utilities_df[util_cols].min(axis=1)
+        importance_data.append({'Attribute': attr_name, 'Average_Range': ranges.mean()})
     
     importance_df = pd.DataFrame(importance_data)
     total_range = importance_df['Average_Range'].sum()
-    importance_df['Importance_%'] = (importance_df['Average_Range'] / total_range) * 100
-    
-    return importance_df
+    if total_range > 0:
+        importance_df['Importance_%'] = (importance_df['Average_Range'] / total_range) * 100
+    else:
+        importance_df['Importance_%'] = 0
+    return importance_df.sort_values('Importance_%', ascending=False)
 
-def calculate_level_performance(utilities_df, attributes_dict):
-    """Calculate average utility for each level within each attribute"""
+@st.cache_data
+def calculate_level_performance(_utilities_df: pd.DataFrame, _attributes_dict: Dict[str, List[str]]) -> pd.DataFrame:
+    """Calculate average utility for each level within each attribute."""
     performance_data = []
-    
-    for attr_name, levels in attributes_dict.items():
+    for attr_name, levels in _attributes_dict.items():
         for level in levels:
             col_name = f"{attr_name}_{level}"
-            avg_utility = utilities_df[col_name].mean()
-            std_utility = utilities_df[col_name].std()
-            
             performance_data.append({
-                'Attribute': attr_name,
-                'Level': level,
-                'Mean_Utility': avg_utility,
-                'Std_Utility': std_utility
+                'Attribute': attr_name, 'Level': level,
+                'Mean_Utility': _utilities_df[col_name].mean(),
+                'Std_Utility': _utilities_df[col_name].std()
             })
-    
     return pd.DataFrame(performance_data)
 
-def predict_share(product_configs, utilities_df, attributes_dict):
-    """Predict market share for given product configurations"""
+def predict_share(product_configs: List[Dict[str, Any]], utilities_df: pd.DataFrame, attributes_dict: Dict[str, List[str]]) -> np.ndarray:
+    """Predict market share for given product configurations using the logit choice rule."""
     n_respondents = len(utilities_df)
     n_products = len(product_configs)
     
-    # Calculate total utility for each product for each respondent
     product_utilities = np.zeros((n_respondents, n_products))
     
     for prod_idx, config in enumerate(product_configs):
-        for resp_idx, (_, resp_utils) in enumerate(utilities_df.iterrows()):
-            total_util = 0
-            for attr_name, level in config.items():
-                col_name = f"{attr_name}_{level}"
-                if col_name in resp_utils:
-                    total_util += resp_utils[col_name]
-            product_utilities[resp_idx, prod_idx] = total_util
-    
-    # Apply multinomial logit choice rule
+        total_util_for_product = pd.Series(0.0, index=utilities_df.index)
+        for attr_name, level in config.items():
+            col_name = f"{attr_name}_{level}"
+            if col_name in utilities_df.columns:
+                total_util_for_product += utilities_df[col_name]
+        product_utilities[:, prod_idx] = total_util_for_product.values
+
     exp_utils = np.exp(product_utilities)
-    shares = exp_utils.sum(axis=0) / exp_utils.sum()
+    sum_exp_utils_per_respondent = exp_utils.sum(axis=1, keepdims=True)
+    sum_exp_utils_per_respondent[sum_exp_utils_per_respondent == 0] = 1 
+    probabilities = exp_utils / sum_exp_utils_per_respondent
+    shares = probabilities.mean(axis=0)
     
     return shares
 
 # ============================================================================
-# SIDEBAR NAVIGATION
+# MAIN APPLICATION LOGIC
 # ============================================================================
 
 st.sidebar.markdown("## 📊 CBC Analysis Platform")
@@ -305,547 +224,235 @@ page = st.sidebar.radio(
     label_visibility="collapsed"
 )
 
-# ============================================================================
-# PAGE 1: DATA UPLOAD & PROCESSING
-# ============================================================================
-
 if page == "📤 Data Upload":
     st.markdown("<div class='main-header'>📤 Data Upload & Processing</div>", unsafe_allow_html=True)
-    
     st.markdown("""
-    ### Instructions
-    Upload your CBC survey data in Excel format with the following columns:
-    - **Respondent ID**: Unique identifier for each participant
-    - **Set**: Choice set number (0, 1, 2, ...)
-    - **Selected Profiles**: Profile chosen by respondent (format: `[Level1, Level2, Level3, ...]`)
-    - **Not Selected Profiles**: Profile(s) not chosen (same format, can be separated by semicolons for multiple)
+    Upload your CBC survey data (Excel/CSV) with columns: `Respondent ID`, `Set`, `Selected Profiles`, and `Not Selected Profiles`. 
+    Profile format should be `[Level1, Level2, ...]`.
     """)
     
     col1, col2 = st.columns([2, 1])
-    
     with col1:
-        uploaded_file = st.file_uploader("Upload Excel File", type=['xlsx', 'xls'])
-    
+        uploaded_file = st.file_uploader("Upload Data File", type=['xlsx', 'xls', 'csv'])
     with col2:
-        num_attributes = st.number_input("Number of Attributes", min_value=2, max_value=10, value=3)
-        attribute_names_input = st.text_area(
-            "Attribute Names (one per line)",
-            value="Brand\nStorage\nPrice",
-            height=150
-        )
+        num_attributes = st.number_input("Number of Attributes", min_value=2, max_value=10, value=3, key="num_attr")
+        attribute_names_input = st.text_area("Attribute Names (one per line)", value="Brand\nStorage\nPrice", height=150, key="attr_names")
     
-    if uploaded_file is not None:
-        # Read the data
-        raw_df = pd.read_excel(uploaded_file)
-        st.session_state.raw_data = raw_df
-        
-        st.success(f"✅ File uploaded successfully! Found {len(raw_df)} rows.")
-        
-        # Show raw data preview
-        with st.expander("📋 View Raw Data"):
-            st.dataframe(raw_df.head(10))
-        
-        # Parse attribute names
-        attribute_names = [name.strip() for name in attribute_names_input.strip().split('\n') if name.strip()]
-        
-        if len(attribute_names) != num_attributes:
-            st.error(f"❌ Please provide exactly {num_attributes} attribute names!")
-        else:
-            st.session_state.attribute_names = attribute_names
-            
-            if st.button("🚀 Process Data", type="primary"):
-                with st.spinner("Processing data..."):
-                    # Process the data
-                    processed_df = process_cbc_data(raw_df, num_attributes)
-                    
-                    if len(processed_df) == 0:
-                        st.error("❌ No data was processed! Please check your data format.")
-                        st.stop()
-                    
-                    # Rename attribute columns with the user-provided names
-                    rename_map = {}
-                    for i, name in enumerate(attribute_names):
-                        rename_map[f'Attribute_{i+1}'] = name
-                    processed_df.rename(columns=rename_map, inplace=True)
-                    
-                    # Detect unique levels for EACH attribute separately
-                    attributes_dict = {}
-                    
-                    st.markdown("### 🔍 Attribute Detection Debug")
-                    
-                    for i, attr_name in enumerate(attribute_names):
-                        if attr_name in processed_df.columns:
-                            # Get only the values from THIS column
-                            column_values = processed_df[attr_name].dropna().astype(str).str.strip()
-                            # Get unique values
-                            unique_vals = sorted(column_values.unique().tolist())
-                            # Remove empty strings
-                            unique_vals = [v for v in unique_vals if v and v != '']
-                            
-                            attributes_dict[attr_name] = unique_vals
-                            
-                            # Debug output
-                            st.write(f"**Column {i+1}: {attr_name}**")
-                            st.write(f"  - Sample values: {column_values.head(5).tolist()}")
-                            st.write(f"  - Unique count: {len(unique_vals)}")
-                        else:
-                            st.error(f"❌ Column '{attr_name}' not found in processed data!")
-                            attributes_dict[attr_name] = []
-                    
-                    st.session_state.attributes = attributes_dict
-                    st.session_state.processed_data = processed_df
-                    st.session_state.data_processed = True
-                    
-                    st.success("✅ Data processed successfully!")
-                    
-                    # Show processed data with better formatting
-                    st.markdown("### 📊 Processed Data Preview")
-                    display_cols = ['Respondent_ID', 'Choice_Set', 'Choice'] + attribute_names
-                    st.dataframe(processed_df[display_cols].head(20), use_container_width=True)
-                    
-                    # Show attribute levels in expandable sections
-                    st.markdown("### ✅ Detected Attribute Levels")
-                    
-                    for i, (attr_name, levels) in enumerate(attributes_dict.items(), 1):
-                        with st.expander(f"**{i}. {attr_name}** ({len(levels)} levels)", expanded=True):
-                            if levels:
-                                # Display as bullets
-                                for level in levels:
-                                    st.write(f"  • {level}")
-                            else:
-                                st.warning("⚠️ No levels detected!")
-                    
-                    st.info("👉 Proceed to 'Model Estimation' to calculate utilities!")
+    attribute_names = [name.strip() for name in attribute_names_input.strip().split('\n') if name.strip()]
+    price_attribute_name = None
+    if attribute_names and len(attribute_names) == num_attributes:
+        price_attribute_name = st.selectbox(
+            "Identify the 'Price' Attribute for Cleaning",
+            options=attribute_names,
+            index=len(attribute_names) - 1,
+            help="This will be used to clean currency symbols and formatting from the price levels."
+        )
 
-# ============================================================================
-# PAGE 2: MODEL ESTIMATION
-# ============================================================================
+    if uploaded_file:
+        try:
+            raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
+            st.session_state.raw_data = raw_df
+            st.success(f"✅ File '{uploaded_file.name}' uploaded successfully! Found {len(raw_df)} rows.")
+            
+            with st.expander("📋 View Raw Data"):
+                st.dataframe(raw_df.head(10))
+            
+            if len(attribute_names) != num_attributes:
+                st.error(f"❌ Please provide exactly {num_attributes} attribute names!")
+            else:
+                st.session_state.attribute_names = attribute_names
+                st.session_state.price_attribute = price_attribute_name
+                
+                if st.button("🚀 Process Data", type="primary"):
+                    with st.spinner("Processing data..."):
+                        processed_df = process_cbc_data(raw_df, num_attributes)
+                        
+                        if processed_df.empty:
+                            st.error("❌ No data was processed! Check file format, attribute count, and profile formatting.")
+                        else:
+                            rename_map = {f'Attribute_{i+1}': name for i, name in enumerate(attribute_names)}
+                            processed_df.rename(columns=rename_map, inplace=True)
+                            
+                            # IMPROVEMENT: Clean the designated price column before detecting levels
+                            if price_attribute_name and price_attribute_name in processed_df.columns:
+                                processed_df[price_attribute_name] = (
+                                    processed_df[price_attribute_name].astype(str)
+                                    .str.replace(r'[$,]', '', regex=True) # Remove $ and commas
+                                    .str.strip()
+                                )
+                                st.info(f"Cleaned the '{price_attribute_name}' column by removing currency symbols and commas.")
+
+                            # Detect unique levels from the (potentially cleaned) data
+                            attributes_dict = {}
+                            for name in attribute_names:
+                                levels = processed_df[name].dropna().astype(str).unique().tolist()
+                                # Try to sort numerically if possible, otherwise sort alphabetically
+                                try:
+                                    attributes_dict[name] = sorted(levels, key=float)
+                                except ValueError:
+                                    attributes_dict[name] = sorted(levels)
+
+                            st.session_state.update({
+                                'attributes': attributes_dict,
+                                'processed_data': processed_df,
+                                'data_processed': True
+                            })
+                            st.success("✅ Data processed successfully!")
+                            st.dataframe(processed_df.head(20))
+                            
+                            st.markdown("### ✅ Detected Attribute Levels")
+                            for attr_name, levels in attributes_dict.items():
+                                with st.expander(f"**{attr_name}** ({len(levels)} levels)", expanded=True):
+                                    st.write(", ".join(map(str, levels)) if levels else "⚠️ No levels detected!")
+                            st.info("👉 Proceed to 'Model Estimation' to calculate utilities!")
+        except Exception as e:
+            st.error(f"An error occurred while reading or processing the file: {e}")
 
 elif page == "🧮 Model Estimation":
     st.markdown("<div class='main-header'>🧮 Model Estimation</div>", unsafe_allow_html=True)
-    
     if not st.session_state.data_processed:
-        st.warning("⚠️ Please upload and process data first!")
+        st.warning("⚠️ Please upload and process data on the 'Data Upload' page first.")
     else:
         st.markdown("""
-        ### Multinomial Logit Model
-        This analysis uses individual-level multinomial logit regression to estimate part-worth utilities.
-        Each respondent's choices are modeled independently to capture heterogeneity in preferences.
+        ### Individual-Level Multinomial Logit Model
+        This analysis uses logistic regression for each respondent to estimate part-worth utilities, capturing individual preferences.
         """)
-        
         processed_df = st.session_state.processed_data
         attributes_dict = st.session_state.attributes
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Respondents", processed_df['Respondent_ID'].nunique())
-        with col2:
-            st.metric("Total Choices", len(processed_df))
-        with col3:
-            st.metric("Attributes", len(attributes_dict))
+        design_df = create_design_matrix(processed_df, attributes_dict)
         
         if st.button("⚡ Run Model Estimation", type="primary"):
             with st.spinner("Estimating utilities... This may take a moment."):
-                # Create design matrix
-                design_df = create_design_matrix(processed_df, attributes_dict)
-                
-                # Estimate utilities
                 utilities_df = estimate_utilities(design_df, attributes_dict)
                 st.session_state.utilities = utilities_df
                 
                 st.success("✅ Model estimation completed!")
-                
-                # Display utilities
-                st.markdown("### Part-Worth Utilities (First 10 Respondents)")
                 st.dataframe(utilities_df.head(10))
-                
-                # Summary statistics
-                st.markdown("### Utility Statistics")
-                util_cols = [col for col in utilities_df.columns if col != 'Respondent_ID']
-                summary_stats = utilities_df[util_cols].describe().T
-                st.dataframe(summary_stats)
-                
-                # Download button for utilities
-                csv_buffer = io.StringIO()
-                utilities_df.to_csv(csv_buffer, index=False)
-                st.download_button(
-                    label="📥 Download Utilities (CSV)",
-                    data=csv_buffer.getvalue(),
-                    file_name="part_worth_utilities.csv",
-                    mime="text/csv"
-                )
-                
                 st.info("👉 Proceed to 'Results & Insights' to view analysis!")
-
-# ============================================================================
-# PAGE 3: RESULTS & INSIGHTS
-# ============================================================================
 
 elif page == "📈 Results & Insights":
     st.markdown("<div class='main-header'>📈 Results & Insights</div>", unsafe_allow_html=True)
-    
     if st.session_state.utilities is None:
-        st.warning("⚠️ Please run model estimation first!")
+        st.warning("⚠️ Please run model estimation on the 'Model Estimation' page first.")
     else:
         utilities_df = st.session_state.utilities
         attributes_dict = st.session_state.attributes
         
-        # Calculate attribute importance
         importance_df = calculate_attribute_importance(utilities_df, attributes_dict)
-        
-        # Calculate level performance
         performance_df = calculate_level_performance(utilities_df, attributes_dict)
         
-        # Attribute Importance Chart
         st.markdown("## 🎯 Attribute Importance")
-        st.markdown("Shows the relative importance of each attribute in driving purchase decisions.")
-        
-        fig_importance = go.Figure(data=[
-            go.Bar(
-                x=importance_df['Importance_%'],
-                y=importance_df['Attribute'],
-                orientation='h',
-                marker=dict(
-                    color=importance_df['Importance_%'],
-                    colorscale='Blues',
-                    showscale=True,
-                    colorbar=dict(title="Importance %")
-                ),
-                text=importance_df['Importance_%'].round(1),
-                texttemplate='%{text}%',
-                textposition='outside'
-            )
-        ])
-        
-        fig_importance.update_layout(
-            title="Attribute Importance (% of Total)",
-            xaxis_title="Importance (%)",
-            yaxis_title="",
-            height=400,
-            showlegend=False,
-            yaxis=dict(categoryorder='total ascending')
-        )
-        
+        fig_importance = px.bar(importance_df, y='Attribute', x='Importance_%', orientation='h',
+                                text='Importance_%', title="Attribute Importance (% of Total)")
+        fig_importance.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+        fig_importance.update_layout(yaxis={'categoryorder':'total ascending'})
         st.plotly_chart(fig_importance, use_container_width=True)
         
-        # Display importance table
-        st.dataframe(importance_df.style.format({'Importance_%': '{:.2f}%', 'Average_Range': '{:.3f}'}))
-        
-        st.markdown("---")
-        
-        # Level Performance Charts
-        st.markdown("## 📊 Level Performance within Attributes")
-        st.markdown("Shows the average utility for each level within each attribute.")
-        
-        # Create separate chart for each attribute
+        st.markdown("## 📊 Level Performance")
         for attr_name in attributes_dict.keys():
-            attr_data = performance_df[performance_df['Attribute'] == attr_name].copy()
-            attr_data = attr_data.sort_values('Mean_Utility', ascending=True)
-            
-            fig_level = go.Figure()
-            
-            fig_level.add_trace(go.Bar(
-                x=attr_data['Mean_Utility'],
-                y=attr_data['Level'],
-                orientation='h',
-                marker=dict(
-                    color=attr_data['Mean_Utility'],
-                    colorscale='RdYlGn',
-                    showscale=False
-                ),
-                text=attr_data['Mean_Utility'].round(3),
-                texttemplate='%{text}',
-                textposition='outside',
-                error_x=dict(
-                    type='data',
-                    array=attr_data['Std_Utility'],
-                    visible=True
-                )
-            ))
-            
-            fig_level.update_layout(
-                title=f"{attr_name} - Level Performance",
-                xaxis_title="Mean Utility",
-                yaxis_title="",
-                height=300,
-                showlegend=False
-            )
-            
+            attr_data = performance_df[performance_df['Attribute'] == attr_name].sort_values('Mean_Utility')
+            fig_level = px.bar(attr_data, y='Level', x='Mean_Utility', orientation='h',
+                               error_x='Std_Utility', title=f"{attr_name} - Level Utilities",
+                               color='Mean_Utility', color_continuous_scale='RdYlGn')
             st.plotly_chart(fig_level, use_container_width=True)
-        
-        # Download performance data
-        csv_buffer = io.StringIO()
-        performance_df.to_csv(csv_buffer, index=False)
-        st.download_button(
-            label="📥 Download Level Performance (CSV)",
-            data=csv_buffer.getvalue(),
-            file_name="level_performance.csv",
-            mime="text/csv"
-        )
-
-# ============================================================================
-# PAGE 4: PRICE OPTIMIZATION
-# ============================================================================
 
 elif page == "💰 Price Optimization":
     st.markdown("<div class='main-header'>💰 Price Optimization</div>", unsafe_allow_html=True)
-    
     if st.session_state.utilities is None:
-        st.warning("⚠️ Please run model estimation first!")
+        st.warning("⚠️ Please run model estimation first.")
+    elif st.session_state.price_attribute is None:
+        st.error("A price attribute was not identified. Please re-process your data on the 'Data Upload' page.")
     else:
         utilities_df = st.session_state.utilities
         attributes_dict = st.session_state.attributes
+        price_attr = st.session_state.price_attribute
         
-        st.markdown("""
-        ### Find Optimal Price
-        Configure your product and find the price point that maximizes preference share or revenue.
-        """)
+        st.info(f"Using **'{price_attr}'** as the price attribute.")
         
-        # Find price attribute
-        price_attr = None
-        for attr in attributes_dict.keys():
-            if 'price' in attr.lower():
-                price_attr = attr
-                break
-        
-        if price_attr is None:
-            st.error("No price attribute found in the data!")
-        else:
-            col1, col2 = st.columns([1, 1])
-            
-            with col1:
-                st.markdown("#### Product Configuration")
-                product_config = {}
-                for attr_name, levels in attributes_dict.items():
-                    if attr_name != price_attr:
-                        product_config[attr_name] = st.selectbox(
-                            f"{attr_name}",
-                            levels,
-                            key=f"opt_{attr_name}"
-                        )
-            
-            with col2:
-                st.markdown("#### Competitor Product")
-                competitor_config = {}
-                for attr_name, levels in attributes_dict.items():
-                    competitor_config[attr_name] = st.selectbox(
-                        f"{attr_name}",
-                        levels,
-                        key=f"comp_{attr_name}"
-                    )
-            
-            if st.button("🔍 Analyze Price Points", type="primary"):
-                with st.spinner("Analyzing prices..."):
-                    price_levels = attributes_dict[price_attr]
-                    
-                    # Calculate share for each price point
-                    results = []
-                    for price in price_levels:
-                        test_config = product_config.copy()
-                        test_config[price_attr] = price
-                        
-                        configs = [test_config, competitor_config]
-                        shares = predict_share(configs, utilities_df, attributes_dict)
-                        
-                        # Extract numeric price
-                        price_numeric = float(re.sub(r'[^\d.]', '', price))
-                        
-                        results.append({
-                            'Price': price,
-                            'Price_Numeric': price_numeric,
-                            'Preference_Share': shares[0] * 100,
-                            'Revenue_Index': shares[0] * price_numeric
-                        })
-                    
-                    results_df = pd.DataFrame(results)
-                    
-                    # Find optimal price
-                    optimal_share_idx = results_df['Preference_Share'].idxmax()
-                    optimal_revenue_idx = results_df['Revenue_Index'].idxmax()
-                    
-                    # Display optimal prices
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric(
-                            "Max Share Price",
-                            results_df.loc[optimal_share_idx, 'Price'],
-                            f"{results_df.loc[optimal_share_idx, 'Preference_Share']:.1f}%"
-                        )
-                    with col2:
-                        st.metric(
-                            "Max Revenue Price",
-                            results_df.loc[optimal_revenue_idx, 'Price'],
-                            f"Index: {results_df.loc[optimal_revenue_idx, 'Revenue_Index']:.1f}"
-                        )
-                    with col3:
-                        avg_share = results_df['Preference_Share'].mean()
-                        st.metric("Average Share", f"{avg_share:.1f}%")
-                    
-                    # Price elasticity curve
-                    fig_price = go.Figure()
-                    
-                    fig_price.add_trace(go.Scatter(
-                        x=results_df['Price_Numeric'],
-                        y=results_df['Preference_Share'],
-                        mode='lines+markers',
-                        name='Preference Share',
-                        line=dict(color='#1f77b4', width=3),
-                        marker=dict(size=10)
-                    ))
-                    
-                    fig_price.add_trace(go.Scatter(
-                        x=results_df['Price_Numeric'],
-                        y=results_df['Revenue_Index'],
-                        mode='lines+markers',
-                        name='Revenue Index',
-                        line=dict(color='#2ca02c', width=3),
-                        marker=dict(size=10),
-                        yaxis='y2'
-                    ))
-                    
-                    fig_price.update_layout(
-                        title="Price Elasticity Analysis",
-                        xaxis_title="Price",
-                        yaxis_title="Preference Share (%)",
-                        yaxis2=dict(
-                            title="Revenue Index",
-                            overlaying='y',
-                            side='right'
-                        ),
-                        height=500,
-                        hovermode='x unified'
-                    )
-                    
-                    st.plotly_chart(fig_price, use_container_width=True)
-                    
-                    # Display table
-                    st.dataframe(results_df.style.format({
-                        'Preference_Share': '{:.2f}%',
-                        'Revenue_Index': '{:.2f}'
-                    }))
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### Your Product Configuration")
+            product_config = {
+                attr: st.selectbox(f"{attr}", levels, key=f"opt_{attr}")
+                for attr, levels in attributes_dict.items() if attr != price_attr
+            }
+        with col2:
+            st.markdown("#### Competitor Product")
+            competitor_config = {
+                attr: st.selectbox(f"{attr}", levels, key=f"comp_{attr}")
+                for attr, levels in attributes_dict.items()
+            }
 
-# ============================================================================
-# PAGE 5: MARKET SIMULATOR
-# ============================================================================
+        if st.button("🔍 Analyze Price Points", type="primary"):
+            with st.spinner("Analyzing prices..."):
+                price_levels = attributes_dict[price_attr]
+                results = []
+                for price in price_levels:
+                    test_config = {**product_config, price_attr: price}
+                    configs = [test_config, competitor_config]
+                    shares = predict_share(configs, utilities_df, attributes_dict)
+                    
+                    try:
+                        price_numeric = float(re.sub(r'[^\d.]', '', str(price)))
+                    except (ValueError, TypeError):
+                        price_numeric = 0
+
+                    results.append({
+                        'Price': price, 'Price_Numeric': price_numeric,
+                        'Preference_Share': shares[0] * 100, 'Revenue_Index': shares[0] * price_numeric
+                    })
+                
+                results_df = pd.DataFrame(results).sort_values('Price_Numeric')
+                
+                if not results_df.empty:
+                    st.subheader("Optimal Price Points")
+                    c1, c2 = st.columns(2)
+                    with c1: st.metric("📈 Max Share Price", results_df.loc[results_df['Preference_Share'].idxmax(), 'Price'])
+                    with c2: st.metric("💵 Max Revenue Price", results_df.loc[results_df['Revenue_Index'].idxmax(), 'Price'])
+                    
+                    fig_price = go.Figure()
+                    fig_price.add_trace(go.Scatter(x=results_df['Price_Numeric'], y=results_df['Preference_Share'], name='Preference Share (%)'))
+                    fig_price.add_trace(go.Scatter(x=results_df['Price_Numeric'], y=results_df['Revenue_Index'], name='Revenue Index', yaxis='y2'))
+                    fig_price.update_layout(title="Price Elasticity Analysis", xaxis_title="Price", yaxis_title="Preference Share (%)",
+                                            yaxis2=dict(title="Revenue Index", overlaying='y', side='right'), hovermode='x unified')
+                    st.plotly_chart(fig_price, use_container_width=True)
+                    st.dataframe(results_df)
 
 elif page == "🎮 Market Simulator":
     st.markdown("<div class='main-header'>🎮 Market Simulator</div>", unsafe_allow_html=True)
-    
     if st.session_state.utilities is None:
-        st.warning("⚠️ Please run model estimation first!")
+        st.warning("⚠️ Please run model estimation first.")
     else:
         utilities_df = st.session_state.utilities
         attributes_dict = st.session_state.attributes
         
-        st.markdown("""
-        ### Preference Share Simulator
-        Configure up to 5 products and see their predicted market shares based on the conjoint model.
-        """)
-        
-        # Number of products to simulate
-        num_products = st.slider("Number of Products", min_value=2, max_value=5, value=3)
-        
-        # Configure products
-        st.markdown("### Configure Products")
-        
+        num_products = st.slider("Number of Products", 2, 5, 3)
         product_configs = []
         cols = st.columns(num_products)
         
         for i, col in enumerate(cols):
             with col:
                 st.markdown(f"#### Product {i+1}")
-                config = {}
-                for attr_name, levels in attributes_dict.items():
-                    config[attr_name] = st.selectbox(
-                        f"{attr_name}",
-                        levels,
-                        key=f"sim_p{i}_{attr_name}"
-                    )
+                config = {attr: st.selectbox(f"{attr}", levels, key=f"sim_p{i}_{attr}")
+                          for attr, levels in attributes_dict.items()}
                 product_configs.append(config)
         
         if st.button("🎯 Calculate Preference Shares", type="primary"):
-            with st.spinner("Calculating shares..."):
-                # Predict shares
-                shares = predict_share(product_configs, utilities_df, attributes_dict)
-                shares_pct = shares * 100
-                
-                # Create results dataframe
-                results_data = []
-                for i, (config, share) in enumerate(zip(product_configs, shares_pct)):
-                    result = {'Product': f'Product {i+1}', 'Share_%': share}
-                    result.update(config)
-                    results_data.append(result)
-                
-                results_df = pd.DataFrame(results_data)
-                
-                # Display metrics
-                st.markdown("### 📊 Preference Shares")
-                metric_cols = st.columns(num_products)
-                for i, (col, share) in enumerate(zip(metric_cols, shares_pct)):
-                    with col:
-                        st.metric(f"Product {i+1}", f"{share:.1f}%")
-                
-                # Pie chart
-                fig_pie = go.Figure(data=[go.Pie(
-                    labels=[f'Product {i+1}' for i in range(num_products)],
-                    values=shares_pct,
-                    hole=0.4,
-                    marker=dict(colors=px.colors.qualitative.Set3[:num_products])
-                )])
-                
-                fig_pie.update_layout(
-                    title="Market Share Distribution",
-                    height=500
-                )
-                
-                st.plotly_chart(fig_pie, use_container_width=True)
-                
-                # Bar chart
-                fig_bar = go.Figure(data=[
-                    go.Bar(
-                        x=[f'Product {i+1}' for i in range(num_products)],
-                        y=shares_pct,
-                        marker=dict(
-                            color=shares_pct,
-                            colorscale='Viridis',
-                            showscale=True,
-                            colorbar=dict(title="Share %")
-                        ),
-                        text=shares_pct.round(1),
-                        texttemplate='%{text}%',
-                        textposition='outside'
-                    )
-                ])
-                
-                fig_bar.update_layout(
-                    title="Preference Share Comparison",
-                    xaxis_title="Product",
-                    yaxis_title="Preference Share (%)",
-                    height=400,
-                    showlegend=False
-                )
-                
-                st.plotly_chart(fig_bar, use_container_width=True)
-                
-                # Product configuration table
-                st.markdown("### Product Configurations")
-                st.dataframe(results_df.style.format({'Share_%': '{:.2f}%'}))
-                
-                # Download results
-                csv_buffer = io.StringIO()
-                results_df.to_csv(csv_buffer, index=False)
-                st.download_button(
-                    label="📥 Download Simulation Results (CSV)",
-                    data=csv_buffer.getvalue(),
-                    file_name="market_simulation.csv",
-                    mime="text/csv"
-                )
+            shares = predict_share(product_configs, utilities_df, attributes_dict) * 100
+            
+            st.markdown("### 📊 Preference Shares")
+            metric_cols = st.columns(num_products)
+            for i, (col, share) in enumerate(zip(metric_cols, shares)):
+                with col: st.metric(f"Product {i+1}", f"{share:.1f}%")
+
+            results_df = pd.DataFrame([{ 'Product': f'Product {i+1}', 'Share_%': share, **config }
+                                       for i, (config, share) in enumerate(zip(product_configs, shares))])
+            
+            fig_pie = px.pie(results_df, values='Share_%', names='Product', title='Market Share Distribution', hole=0.4)
+            st.plotly_chart(fig_pie, use_container_width=True)
+            st.dataframe(results_df.style.format({'Share_%': '{:.2f}%'}))
 
 # Footer
 st.sidebar.markdown("---")
-st.sidebar.markdown("""
-<div style='text-align: center; color: #666; font-size: 0.8rem;'>
-    <p><strong>CBC Analysis Platform</strong></p>
-    <p>Built with Streamlit & Python</p>
-</div>
-""", unsafe_allow_html=True)
+st.sidebar.info("CBC Analysis Platform | Built with Streamlit & Python")
