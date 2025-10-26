@@ -59,57 +59,79 @@ if 'attribute_names' not in st.session_state:
 
 def parse_profile(profile_str):
     """Parse profile string like '[Brand, Storage, Price]' into list"""
-    if pd.isna(profile_str) or profile_str == '':
-        return []
-    # Remove brackets and split by comma
-    profile_str = str(profile_str).strip('[]')
-    return [item.strip() for item in profile_str.split(',')]
+    if pd.isna(profile_str) or profile_str == '' or profile_str is None:
+        return None
+    
+    # Convert to string and clean
+    profile_str = str(profile_str).strip()
+    
+    # Remove outer brackets
+    if profile_str.startswith('[') and profile_str.endswith(']'):
+        profile_str = profile_str[1:-1]
+    
+    # Split by comma and clean each value
+    values = [item.strip() for item in profile_str.split(',') if item.strip()]
+    
+    return values if values else None
 
 def process_cbc_data(df, num_attributes):
     """Process raw CBC data into format suitable for modeling"""
     processed_rows = []
     
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         respondent_id = row['Respondent ID']
         choice_set = row['Set']
         
-        # Parse selected and not selected profiles
+        # Parse selected profile
         selected = parse_profile(row['Selected Profiles'])
-        not_selected_str = row['Not Selected Profiles']
         
-        # Handle multiple not selected profiles (separated by semicolon)
-        if pd.notna(not_selected_str) and ';' in str(not_selected_str):
-            not_selected_list = [parse_profile(p.strip()) for p in str(not_selected_str).split(';') if p.strip()]
-        else:
-            not_selected_list = [parse_profile(not_selected_str)]
+        # Skip if selected profile is invalid
+        if selected is None or len(selected) != num_attributes:
+            continue
         
-        # Filter out any None or empty profiles
-        not_selected_list = [p for p in not_selected_list if p and len(p) == num_attributes]
+        # Parse not selected profiles
+        not_selected_str = str(row['Not Selected Profiles']) if pd.notna(row['Not Selected Profiles']) else ''
         
-        # Add selected profile with choice = 1
-        if selected and len(selected) == num_attributes:
+        # Split by semicolon for multiple alternatives
+        not_selected_raw = [p.strip() for p in not_selected_str.split(';') if p.strip()]
+        
+        # Parse each not selected profile
+        not_selected_list = []
+        for ns_str in not_selected_raw:
+            ns_parsed = parse_profile(ns_str)
+            if ns_parsed is not None and len(ns_parsed) == num_attributes:
+                not_selected_list.append(ns_parsed)
+        
+        # Add selected profile (Choice = 1)
+        row_data = {
+            'Respondent_ID': respondent_id,
+            'Choice_Set': choice_set,
+            'Choice': 1
+        }
+        for attr_idx in range(num_attributes):
+            row_data[f'Attribute_{attr_idx+1}'] = selected[attr_idx]
+        processed_rows.append(row_data)
+        
+        # Add not selected profiles (Choice = 0)
+        for not_selected in not_selected_list:
             row_data = {
                 'Respondent_ID': respondent_id,
                 'Choice_Set': choice_set,
-                'Choice': 1
+                'Choice': 0
             }
-            for i, val in enumerate(selected):
-                row_data[f'Attribute_{i+1}'] = val.strip()
+            for attr_idx in range(num_attributes):
+                row_data[f'Attribute_{attr_idx+1}'] = not_selected[attr_idx]
             processed_rows.append(row_data)
-        
-        # Add not selected profiles with choice = 0
-        for not_selected in not_selected_list:
-            if len(not_selected) == num_attributes:
-                row_data = {
-                    'Respondent_ID': respondent_id,
-                    'Choice_Set': choice_set,
-                    'Choice': 0
-                }
-                for i, val in enumerate(not_selected):
-                    row_data[f'Attribute_{i+1}'] = val.strip()
-                processed_rows.append(row_data)
     
-    return pd.DataFrame(processed_rows)
+    result_df = pd.DataFrame(processed_rows)
+    
+    # Debug: Print summary
+    if len(result_df) > 0:
+        print(f"Processed {len(result_df)} choice observations")
+        print(f"Unique respondents: {result_df['Respondent_ID'].nunique()}")
+        print(f"Choices per set: {result_df.groupby(['Respondent_ID', 'Choice_Set']).size().mean():.1f}")
+    
+    return result_df
 
 def create_design_matrix(df, attributes_dict):
     """Create dummy-coded design matrix for conjoint analysis"""
@@ -307,21 +329,38 @@ if page == "📤 Data Upload":
                     # Process the data
                     processed_df = process_cbc_data(raw_df, num_attributes)
                     
-                    # Rename attribute columns
-                    for i, name in enumerate(attribute_names):
-                        processed_df.rename(columns={f'Attribute_{i+1}': name}, inplace=True)
+                    if len(processed_df) == 0:
+                        st.error("❌ No data was processed! Please check your data format.")
+                        st.stop()
                     
-                    # Detect unique levels for each attribute - SEPARATELY BY COLUMN
+                    # Rename attribute columns with the user-provided names
+                    rename_map = {}
+                    for i, name in enumerate(attribute_names):
+                        rename_map[f'Attribute_{i+1}'] = name
+                    processed_df.rename(columns=rename_map, inplace=True)
+                    
+                    # Detect unique levels for EACH attribute separately
                     attributes_dict = {}
-                    for attr_name in attribute_names:
+                    
+                    st.markdown("### 🔍 Attribute Detection Debug")
+                    
+                    for i, attr_name in enumerate(attribute_names):
                         if attr_name in processed_df.columns:
-                            # Get unique levels for THIS specific attribute only
-                            levels = sorted(processed_df[attr_name].dropna().unique().tolist())
-                            # Remove any empty strings
-                            levels = [str(l).strip() for l in levels if str(l).strip() != '']
-                            attributes_dict[attr_name] = levels
+                            # Get only the values from THIS column
+                            column_values = processed_df[attr_name].dropna().astype(str).str.strip()
+                            # Get unique values
+                            unique_vals = sorted(column_values.unique().tolist())
+                            # Remove empty strings
+                            unique_vals = [v for v in unique_vals if v and v != '']
+                            
+                            attributes_dict[attr_name] = unique_vals
+                            
+                            # Debug output
+                            st.write(f"**Column {i+1}: {attr_name}**")
+                            st.write(f"  - Sample values: {column_values.head(5).tolist()}")
+                            st.write(f"  - Unique count: {len(unique_vals)}")
                         else:
-                            st.error(f"Column {attr_name} not found in processed data!")
+                            st.error(f"❌ Column '{attr_name}' not found in processed data!")
                             attributes_dict[attr_name] = []
                     
                     st.session_state.attributes = attributes_dict
@@ -330,17 +369,22 @@ if page == "📤 Data Upload":
                     
                     st.success("✅ Data processed successfully!")
                     
-                    # Show processed data
-                    st.markdown("### Processed Data Preview")
-                    st.dataframe(processed_df.head(20))
+                    # Show processed data with better formatting
+                    st.markdown("### 📊 Processed Data Preview")
+                    display_cols = ['Respondent_ID', 'Choice_Set', 'Choice'] + attribute_names
+                    st.dataframe(processed_df[display_cols].head(20), use_container_width=True)
                     
-                    # Show attribute levels - CLEARER FORMAT
-                    st.markdown("### Detected Attribute Levels")
+                    # Show attribute levels in expandable sections
+                    st.markdown("### ✅ Detected Attribute Levels")
                     
-                    # Create a nice table format
                     for i, (attr_name, levels) in enumerate(attributes_dict.items(), 1):
                         with st.expander(f"**{i}. {attr_name}** ({len(levels)} levels)", expanded=True):
-                            st.write("Levels: " + " | ".join(levels))
+                            if levels:
+                                # Display as bullets
+                                for level in levels:
+                                    st.write(f"  • {level}")
+                            else:
+                                st.warning("⚠️ No levels detected!")
                     
                     st.info("👉 Proceed to 'Model Estimation' to calculate utilities!")
 
