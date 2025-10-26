@@ -77,6 +77,7 @@ def parse_profile(profile_str):
 def process_cbc_data(df, num_attributes):
     """Process raw CBC data into format suitable for modeling"""
     processed_rows = []
+    parsing_errors = []
     
     for idx, row in df.iterrows():
         respondent_id = row['Respondent ID']
@@ -85,22 +86,45 @@ def process_cbc_data(df, num_attributes):
         # Parse selected profile
         selected = parse_profile(row['Selected Profiles'])
         
+        # Debug first few rows
+        if idx < 3:
+            print(f"\n=== Row {idx} Debug ===")
+            print(f"Selected raw: '{row['Selected Profiles']}'")
+            print(f"Selected parsed: {selected}")
+            print(f"Not Selected raw: '{row['Not Selected Profiles']}'")
+        
         # Skip if selected profile is invalid
         if selected is None or len(selected) != num_attributes:
+            parsing_errors.append(f"Row {idx}: Invalid selected profile (got {len(selected) if selected else 0} attrs, expected {num_attributes})")
             continue
         
         # Parse not selected profiles
         not_selected_str = str(row['Not Selected Profiles']) if pd.notna(row['Not Selected Profiles']) else ''
         
-        # Split by semicolon for multiple alternatives
-        not_selected_raw = [p.strip() for p in not_selected_str.split(';') if p.strip()]
+        # CRITICAL FIX: Split by semicolon first, THEN by brackets
+        # Some files may have format: [A,B,C];[D,E,F] or [A,B,C] [D,E,F]
+        # Need to find all bracketed groups
+        import re
         
-        # Parse each not selected profile
+        # Find all complete bracketed profiles
+        bracket_pattern = r'\[([^\]]+)\]'
+        not_selected_matches = re.findall(bracket_pattern, not_selected_str)
+        
+        if idx < 3:
+            print(f"Not Selected matches: {not_selected_matches}")
+        
+        # Parse each matched profile
         not_selected_list = []
-        for ns_str in not_selected_raw:
-            ns_parsed = parse_profile(ns_str)
-            if ns_parsed is not None and len(ns_parsed) == num_attributes:
-                not_selected_list.append(ns_parsed)
+        for match in not_selected_matches:
+            # match is already inside brackets, so just split by comma
+            values = [v.strip() for v in match.split(',') if v.strip()]
+            if len(values) == num_attributes:
+                not_selected_list.append(values)
+                if idx < 3:
+                    print(f"  Parsed: {values}")
+            else:
+                if idx < 3:
+                    print(f"  SKIPPED (wrong length): {values}")
         
         # Add selected profile (Choice = 1)
         row_data = {
@@ -127,9 +151,14 @@ def process_cbc_data(df, num_attributes):
     
     # Debug: Print summary
     if len(result_df) > 0:
+        print(f"\n=== Processing Summary ===")
         print(f"Processed {len(result_df)} choice observations")
         print(f"Unique respondents: {result_df['Respondent_ID'].nunique()}")
-        print(f"Choices per set: {result_df.groupby(['Respondent_ID', 'Choice_Set']).size().mean():.1f}")
+        print(f"Alternatives per set: {result_df.groupby(['Respondent_ID', 'Choice_Set']).size().mean():.1f}")
+        if parsing_errors:
+            print(f"\nParsing errors: {len(parsing_errors)}")
+            for error in parsing_errors[:5]:
+                print(f"  - {error}")
     
     return result_df
 
